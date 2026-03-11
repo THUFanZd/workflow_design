@@ -112,7 +112,6 @@ class ExperimentPlan:
 @dataclass
 class ActivationTokenEvidence:
     token: str
-    token_id: int
     activation: float
     token_index: int
 
@@ -122,6 +121,7 @@ class PromptActivationEvidence:
     prompt: str
     score: float
     nonzero_tokens: List[ActivationTokenEvidence]
+    prompt_tokens: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1161,10 +1161,9 @@ class FeatureExperimentRunner:
     @staticmethod
     def _extract_nonzero_tokens(trace: Dict[str, Any]) -> List[ActivationTokenEvidence]:
         tokens = trace.get("tokens", [])
-        token_ids = trace.get("token_ids", [])
         per_token = trace.get("per_token_activation", [])
         out: List[ActivationTokenEvidence] = []
-        limit = min(len(tokens), len(token_ids), len(per_token))
+        limit = min(len(tokens), len(per_token))
         for idx in range(limit):
             act = float(per_token[idx])
             if act == 0.0:
@@ -1172,23 +1171,29 @@ class FeatureExperimentRunner:
             out.append(
                 ActivationTokenEvidence(
                     token=str(tokens[idx]),
-                    token_id=int(token_ids[idx]),
                     activation=act,
                     token_index=int(idx),
                 )
             )
         return out
 
-    def _activation_scores(self, prompts: Sequence[str]) -> List[PromptActivationEvidence]:
+    def _activation_scores(
+        self,
+        prompts: Sequence[str],
+        *,
+        include_prompt_tokens: bool = True,
+    ) -> List[PromptActivationEvidence]:
         out: List[PromptActivationEvidence] = []
         for prompt in prompts:
             trace = self.module.get_activation_trace(prompt)
             score = float(trace.get("summary_activation", 0.0))
+            tokens = [str(tok) for tok in trace.get("tokens", [])]
             out.append(
                 PromptActivationEvidence(
                     prompt=prompt,
                     score=score,
                     nonzero_tokens=self._extract_nonzero_tokens(trace),
+                    prompt_tokens=tokens if include_prompt_tokens else [],
                 )
             )
         return out
@@ -1197,7 +1202,10 @@ class FeatureExperimentRunner:
         self,
         plan: ExperimentPlan,
     ) -> InputEvidence:
-        pos_scores = self._activation_scores(plan.activation_positive_prompts)
+        pos_scores = self._activation_scores(
+            plan.activation_positive_prompts,
+            include_prompt_tokens=True,
+        )
         neg_scores = self._activation_scores(plan.activation_negative_prompts)
         boundary_scores = self._activation_scores(plan.boundary_prompts)
 
