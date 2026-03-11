@@ -684,44 +684,48 @@ class AgentBrain:
             "5) Prefer specific patterns over vague themes.\n"
             "Return strict JSON only."
         )
-        user_prompt = json.dumps(
+        observation_context = json.dumps(
+            self._format_observation_context(observation),
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema_prompt = json.dumps(
             {
-                "task": "Propose candidate feature hypotheses with explicit testability.",
-                "constraints": [
-                    "Input-side hypothesis must clearly describe what contexts activate this feature and where it should fail.",
-                    "Output-side hypothesis must predict expected logit increase/decrease tokens under feature amplification.",
-                    "Description should be precise, not generic. No more than 40 words.",
-                    "A good explanation needs to enable people to distinguish what kind of input can activate the feature, "
-                    "and what kind of token's logits will increase or decrease when intervening on the feature."
-                ],
-                "evidence_quality_guidance": [
-                    "Activation side: Use top activating examples and seed contexts to infer triggering patterns.",
-                    "Causal side: Use positive/negative logits as weak priors for expected intervention effects.",
-                ],
-                "number_of_hypotheses": int(num_hypotheses),
-                "observation": self._format_observation_context(observation),
-                "schema": {
-                    "hypotheses": [
-                        {
-                            "hypothesis_id": "h1",
-                            "input-side feature description": "a description of the input-side feature",
-                            "output-side feature description": "a description of the output-side feature",
-                            "expected_logit_increase": ["token"],
-                            "expected_logit_decrease": ["token"],
-                            "confidence_prior": "a score",
-                        }
-                    ]
-                },
-                "field_descriptions": {
-                    "hypothesis_id": "identifier (e.g., h1, h2)",
-                    "input-side/output-side feature description": "observation-based description, each no more than 40 words each.",
-                    "expected_logit_increase": "tokens expected to increase under amplification",
-                    "expected_logit_decrease": "tokens expected to decrease under amplification",
-                    "confidence_prior": "confidence score between 0 and 1",
-                },
+                "hypotheses": [
+                    {
+                        "hypothesis_id": "h1",
+                        "input-side feature description": "a description of the input-side feature",
+                        "output-side feature description": "a description of the output-side feature",
+                        "expected_logit_increase": ["token"],
+                        "expected_logit_decrease": ["token"],
+                        "confidence_prior": "a score",
+                    }
+                ]
             },
             ensure_ascii=False,
             indent=2,
+        )
+        user_prompt = (
+            "Task: Propose candidate feature hypotheses with explicit testability.\n"
+            "Constraints:\n"
+            "- Input-side hypothesis must clearly describe what contexts activate this feature and where it should fail.\n"
+            "- Output-side hypothesis must predict expected logit increase/decrease tokens under feature amplification.\n"
+            "- Description should be precise, not generic. No more than 40 words.\n"
+            "- A good explanation needs to enable people to distinguish what kind of input can activate the feature, and what kind of token's logits will increase or decrease when intervening on the feature.\n"
+            "Evidence quality guidance:\n"
+            "- Activation side: Use top activating examples and seed contexts to infer triggering patterns.\n"
+            "- Causal side: Use positive/negative logits as weak priors for expected intervention effects.\n"
+            f"Number of hypotheses: {int(num_hypotheses)}\n\n"
+            "Observation:\n"
+            f"{observation_context}\n\n"
+            "Output schema (JSON):\n"
+            f"{schema_prompt}\n\n"
+            "Field descriptions:\n"
+            "- hypothesis_id: identifier (e.g., h1, h2)\n"
+            "- input-side/output-side feature description: observation-based description, each no more than 40 words each.\n"
+            "- expected_logit_increase: tokens expected to increase under amplification\n"
+            "- expected_logit_decrease: tokens expected to decrease under amplification\n"
+            "- confidence_prior: confidence score between 0 and 1"
         )
 
         llm_json = self.reasoner.chat_json(
@@ -828,30 +832,37 @@ class AgentBrain:
             "Construct examples based on the output-side hypothesis description.\n"
             "Return strict JSON only."
         )
-        user_prompt = json.dumps(
+        hypothesis_context = json.dumps(asdict(hypothesis), ensure_ascii=False, indent=2)
+        memory_context_json = json.dumps(
+            self._format_memory_context(memory_context),
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema_prompt = json.dumps(
             {
-                "task": "Plan prompt-level experiments for this hypothesis.",
-                "round": int(round_idx),
-                "prompts_per_split": int(prompts_per_split),
-                "hypothesis": asdict(hypothesis),
-                # "observation_context": self._format_observation_context(observation),
-                # design experiment should just base on hypothesis
-                "memory_from_past_runs": self._format_memory_context(memory_context),
-                "design_requirements": {
-                    "activation_positive": "Should include hypothesized trigger semantics in diverse phrasing.",
-                    "activation_negative": "Should be hard negatives (close topic but missing key trigger).",
-                    "boundary": "Must include at least one near-counterexample and one confounder.",
-                    "causal": "Should place a predictive next-token position where style/semantics can shift.",
-                },  # 相当于 field_descriptions
-                "schema": {
-                    "activation_positive_prompts": ["..."],
-                    "activation_negative_prompts": ["..."],
-                    "boundary_prompts": ["..."],
-                    "causal_prompts": ["..."],
-                }
+                "activation_positive_prompts": ["..."],
+                "activation_negative_prompts": ["..."],
+                "boundary_prompts": ["..."],
+                "causal_prompts": ["..."],
             },
             ensure_ascii=False,
             indent=2,
+        )
+        user_prompt = (
+            "Task: Plan prompt-level experiments for this hypothesis.\n"
+            f"Round: {int(round_idx)}\n"
+            f"Prompts per split: {int(prompts_per_split)}\n\n"
+            "Hypothesis:\n"
+            f"{hypothesis_context}\n\n"
+            "Memory from past runs:\n"
+            f"{memory_context_json}\n\n"
+            "Design requirements:\n"
+            "- activation_positive: Should include hypothesized trigger semantics in diverse phrasing.\n"
+            "- activation_negative: Should be hard negatives (close topic but missing key trigger).\n"
+            "- boundary: Must include at least one near-counterexample and one confounder.\n"
+            "- causal: Should place a predictive next-token position where style/semantics can shift.\n\n"
+            "Output schema (JSON):\n"
+            f"{schema_prompt}"
         )
         llm_json = self.reasoner.chat_json(
             system_prompt=system_prompt,
@@ -945,55 +956,55 @@ class AgentBrain:
                     },
                 }
             )
-        user_prompt = json.dumps(
+        evidence_context = json.dumps(evidence_payload, ensure_ascii=False, indent=2)
+        memory_context_json = json.dumps(
+            self._format_memory_context(memory_context),
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema_prompt = json.dumps(
             {
-                "task": "Refine hypotheses and keep only the strongest candidates.",
-                "round": int(round_idx),
-                "keep_top_k": int(keep_top_k),
-                "description of evidence fields": {  # Note 分数的计算 分数的合理性
-                    "score": "The score of the hypothesis, based on the input and output evidence.",
-                    "separation": "The separation between the activation and non-activation examples.",
-                    "counterexamples": "Counterexamples that violate the hypothesis. \
-                        This is an important basis for your improvement request.",
-                    "boundary_violation_rate": "The rate of boundary violations in the input evidence.",
-                    "missing_expected_tokens": "Tokens that are expected but not found in the output.",
-                    "sign_consistency": "Consistency of the sign of logit changes.",
-                    "amplify_top_increase": "Top tokens that increase logits the most.",
-                    "amplify_top_decrease": "Top tokens that decrease logits the most.",
-                },
-                "evidence": evidence_payload,
-                "memory_from_past_runs": self._format_memory_context(memory_context),
-                "refinement_policy": {
-                    # Note more detailed stop conditions
-                    "drop_if": [
-                        "high boundary violation and low output coverage",
-                        "repeated counterexample failures across rounds",
-                    ],
-                    "keep_if": [
-                        "good activation separation and stable sign-consistent causal effects",
-                    ],
-                },
-                "schema": {
-                    "hypotheses": [
-                        {
-                            "hypothesis_id": "h1r",
-                            "description": "refined description",
-                            "expected_logit_increase": ["..."],
-                            "expected_logit_decrease": ["..."],
-                            "confidence_prior": 0.5,
-                        }
-                    ]
-                },
-                "field_descriptions": {
-                    "hypothesis_id": "identifier (e.g., h1r as h1 refined)",
-                    "input-side/output-side feature description": "observation-based description, <= 40 words each.",
-                    "expected_logit_increase": "tokens expected to increase under amplification",
-                    "expected_logit_decrease": "tokens expected to decrease under amplification",
-                    "confidence_prior": "confidence score between 0 and 1",
-                },
+                "hypotheses": [
+                    {
+                        "hypothesis_id": "h1r",
+                        "description": "refined description",
+                        "expected_logit_increase": ["..."],
+                        "expected_logit_decrease": ["..."],
+                        "confidence_prior": 0.5,
+                    }
+                ]
             },
             ensure_ascii=False,
             indent=2,
+        )
+        user_prompt = (
+            "Task: Refine hypotheses and keep only the strongest candidates.\n"
+            f"Round: {int(round_idx)}\n"
+            f"keep_top_k: {int(keep_top_k)}\n\n"
+            "Description of evidence fields:\n"
+            "- score: The score of the hypothesis, based on the input and output evidence.\n"
+            "- separation: The separation between the activation and non-activation examples.\n"
+            "- counterexamples: Counterexamples that violate the hypothesis. This is an important basis for your improvement request.\n"
+            "- boundary_violation_rate: The rate of boundary violations in the input evidence.\n"
+            "- missing_expected_tokens: Tokens that are expected but not found in the output.\n"
+            "- sign_consistency: Consistency of the sign of logit changes.\n"
+            "- amplify_top_increase: Top tokens that increase logits the most.\n"
+            "- amplify_top_decrease: Top tokens that decrease logits the most.\n\n"
+            "Evidence:\n"
+            f"{evidence_context}\n\n"
+            "Memory from past runs:\n"
+            f"{memory_context_json}\n\n"
+            "Refinement policy:\n"
+            "- drop_if: high boundary violation and low output coverage; repeated counterexample failures across rounds.\n"
+            "- keep_if: good activation separation and stable sign-consistent causal effects.\n\n"
+            "Output schema (JSON):\n"
+            f"{schema_prompt}\n\n"
+            "Field descriptions:\n"
+            "- hypothesis_id: identifier (e.g., h1r as h1 refined)\n"
+            "- input-side/output-side feature description: observation-based description, <= 40 words each.\n"
+            "- expected_logit_increase: tokens expected to increase under amplification\n"
+            "- expected_logit_decrease: tokens expected to decrease under amplification\n"
+            "- confidence_prior: confidence score between 0 and 1"
         )
 
         llm_json = self.reasoner.chat_json(
@@ -1043,26 +1054,46 @@ class AgentBrain:
             "- Combined explanation: only if causally coherent.\n"
             "Return strict JSON only."
         )
-        user_prompt = json.dumps(
+        observation_context = json.dumps(
+            self._format_observation_context(observation),
+            ensure_ascii=False,
+            indent=2,
+        )
+        best_result_context = json.dumps(
             {
-                "task": "Produce input-side explanation, output-side explanation, and fused explanation.",
-                "observation": self._format_observation_context(observation),
-                "best_result": {
-                    "hypothesis": asdict(best_row.hypothesis),
-                    "input_evidence": asdict(best_row.input_evidence),
-                    "output_evidence": asdict(best_row.output_evidence),
-                },
-                "memory_from_past_runs": self._format_memory_context(memory_context),
-                "schema": {
-                    "input_side_explanation": "string",
-                    "output_side_explanation": "string",
-                    "combined_explanation": "string",
-                    "boundaries": ["string"],
-                    "testable_predictions": ["string"],
-                },
+                "hypothesis": asdict(best_row.hypothesis),
+                "input_evidence": asdict(best_row.input_evidence),
+                "output_evidence": asdict(best_row.output_evidence),
             },
             ensure_ascii=False,
             indent=2,
+        )
+        memory_context_json = json.dumps(
+            self._format_memory_context(memory_context),
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema_prompt = json.dumps(
+            {
+                "input_side_explanation": "string",
+                "output_side_explanation": "string",
+                "combined_explanation": "string",
+                "boundaries": ["string"],
+                "testable_predictions": ["string"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        user_prompt = (
+            "Task: Produce input-side explanation, output-side explanation, and fused explanation.\n\n"
+            "Observation:\n"
+            f"{observation_context}\n\n"
+            "Best result:\n"
+            f"{best_result_context}\n\n"
+            "Memory from past runs:\n"
+            f"{memory_context_json}\n\n"
+            "Output schema (JSON):\n"
+            f"{schema_prompt}"
         )
         llm_json = self.reasoner.chat_json(
             system_prompt=system_prompt,
