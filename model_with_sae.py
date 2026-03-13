@@ -251,9 +251,20 @@ class ModelWithSAEModule:
         if isinstance(self.sae, dict) and "__sae_lens_obj__" in self.sae:
             sae_obj = self.sae["__sae_lens_obj__"]
             cfg = getattr(sae_obj, "cfg", None)
-            metadata = getattr(cfg, "metadata", None)
-            if isinstance(metadata, dict):
-                self.hook_name = metadata.get("hook_name")
+            
+            # 1. 尝试直接从 cfg 获取 (支持较新版本的 sae-lens)
+            if hasattr(cfg, "hook_name") and cfg.hook_name:
+                self.hook_name = cfg.hook_name
+            else:
+                # 2. 回退到从 metadata 获取 (兼容老版本)
+                metadata = getattr(cfg, "metadata", None)
+                if isinstance(metadata, dict):
+                    self.hook_name = metadata.get("hook_name")
+                    
+            # 3. 终极兜底：如果还是没拿到，根据层数手动推断 (TransformerLens 默认格式)
+            if not self.hook_name and self.layer is not None:
+                self.hook_name = f"blocks.{self.layer}.hook_resid_post"
+
             if isinstance(self.hook_name, str) and self.hook_name:
                 self.act_hook_name = self.hook_name + ".hook_sae_acts_post"
 
@@ -1152,3 +1163,48 @@ __all__ = [
     "load_sae",
 ]
 
+
+if __name__ == "__main__":
+    llm_name = "google/gemma-2-2b"
+    
+    # 确保 sae_path 中的 layer_6 和下方的 sae_layer=6 保持一致
+    sae_path = "sae-lens://release=gemma-scope-2b-pt-res;sae_id=layer_6/width_16k/average_l0_70"
+    test_feature_index = 0 
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"⏳ 正在初始化 ModelWithSAEModule (设备: {device})...")
+    module = ModelWithSAEModule(
+        llm_name=llm_name,
+        sae_path=sae_path,
+        sae_layer=6,             # 【修改点1】修正为 6 
+        feature_index=test_feature_index,
+        device=device,
+        debug=True
+    )
+
+    prompt = "Hello, world! This is a simple prompt to test SAE forward pass."
+    print(f"\n🚀 开始执行前向传播并提取特征激活...\nPrompt: '{prompt}'")
+
+    # 【修改点2】去掉了 try...except 捕获，让系统原生的报错 Traceback 直接暴露出来
+    trace_result = module.get_activation_trace(prompt)
+    
+    print("\n" + "="*40)
+    print("🎯 激活追踪结果 (Activation Trace)")
+    print("="*40)
+    
+    tokens = trace_result.get("tokens", [])
+    activations = trace_result.get("per_token_activation", [])
+    
+    print(f"监测特征 ID: {test_feature_index}")
+    print(f"最大激活值 (Max): {trace_result.get('summary_activation')}")
+    print(f"平均激活值 (Mean): {trace_result.get('summary_activation_mean')}")
+    print(f"最大激活对应的 Token 索引: {trace_result.get('max_token_index')}")
+    print("\n📊 逐 Token 激活详情:")
+    
+    if tokens and activations and len(tokens) == len(activations):
+        for i, (tok, act) in enumerate(zip(tokens, activations)):
+            marker = " <--- MAX" if i == trace_result.get("max_token_index") else ""
+            print(f"  [{i:02d}] {tok:>15} : {act:.4f}{marker}")
+    else:
+        print("⚠️ 未能正确获取 tokens 或激活值列表。")

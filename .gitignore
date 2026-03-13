@@ -4,3 +4,4 @@ __pycache__/
 outputs/
 *.pdf
 models/
+a.py
