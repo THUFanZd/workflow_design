@@ -6,6 +6,7 @@ import os
 import re
 import statistics
 import traceback
+from difflib import SequenceMatcher
 from datetime import datetime, timezone, timedelta
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -81,6 +82,19 @@ def _clip01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
 
+def _normalize_prompt_key(prompt: str) -> str:
+    text = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+    return text
+
+
+def _description_similarity(a: str, b: str) -> float:
+    a_norm = re.sub(r"\s+", " ", str(a or "").strip().lower())
+    b_norm = re.sub(r"\s+", " ", str(b or "").strip().lower())
+    if not a_norm or not b_norm:
+        return 0.0
+    return float(SequenceMatcher(None, a_norm, b_norm).ratio())
+
+
 @dataclass
 class NeuronpediaObservation:
     model_id: str
@@ -125,6 +139,15 @@ class PromptActivationEvidence:
 
 
 @dataclass
+class FailureEvent:
+    type: str  # boundary_violation | negative_fp | positive_fn
+    prompt: str
+    score: float
+    threshold: float
+    margin: float
+
+
+@dataclass
 class InputEvidence:
     positive_scores: List[PromptActivationEvidence]
     negative_scores: List[PromptActivationEvidence]
@@ -135,6 +158,7 @@ class InputEvidence:
     negative_reject_rate: float
     boundary_violation_rate: float
     separation: float
+    failure_events: List[FailureEvent]
     counterexamples: List[str]
     score: float
 
@@ -191,7 +215,7 @@ class ReasoningMemoryStore:
         china_tz = timezone(timedelta(hours=8))
         record.setdefault("timestamp", datetime.now(china_tz).isoformat() + "Z")
         with self.memory_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _load_recent(self, feature_id: int, limit: int = 12) -> List[Dict[str, Any]]:
         # aborted
@@ -619,18 +643,79 @@ class AgentBrain:
             return []
         compact: List[Dict[str, Any]] = []
         for row in memory_context[-8:]:
+            raw_failure_events = row.get("failure_events", [])
+            failure_events: List[Dict[str, Any]] = []
+            if isinstance(raw_failure_events, list):
+                for event in raw_failure_events:
+                    if not isinstance(event, dict):
+                        continue
+                    prompt = str(event.get("prompt", "")).strip()
+                    if not prompt:
+                        continue
+                    try:
+                        margin = float(event.get("margin", 0.0))
+                    except Exception:
+                        margin = 0.0
+                    try:
+                        score = float(event.get("score", 0.0))
+                    except Exception:
+                        score = 0.0
+                    try:
+                        threshold = float(event.get("threshold", 0.0))
+                    except Exception:
+                        threshold = 0.0
+                    failure_events.append(
+                        {
+                            "type": str(event.get("type", "")),
+                            "prompt": prompt,
+                            "score": score,
+                            "threshold": threshold,
+                            "margin": margin,
+                        }
+                    )
+            failure_events.sort(key=lambda x: float(x.get("margin", 0.0)), reverse=True)
             compact.append(
                 {
                     # "timestamp": row.get("timestamp"),
                     "round": row.get("round"),
                     "hypothesis_id": row.get("hypothesis_id"),
-                    # "score": row.get("score"),
-                    "notes": row.get("notes"),
-                    "counterexamples": row.get("counterexamples", [])[:2],
-                    "missing_expected_tokens": row.get("missing_expected_tokens", [])[:3],
+                    "hypothesis_summary": row.get("hypothesis_summary") or row.get("notes"),
+                    "counterexamples": row.get("counterexamples", []),
+                    "failure_events": failure_events[:6],
+                    "repeated_boundary_failures": row.get("repeated_boundary_failures", []),
+                    "missing_expected_tokens": row.get("missing_expected_tokens", [])[:4],
+                    "score_breakdown": row.get("score_breakdown", {}),
                 }
             )
         return compact
+
+    @staticmethod
+    def _has_repeated_boundary_failures(memory_context: Optional[List[Dict[str, Any]]]) -> bool:
+        if not memory_context:
+            return False
+        for row in memory_context[-8:]:
+            repeated = row.get("repeated_boundary_failures", [])
+            if isinstance(repeated, list) and repeated:
+                return True
+        return False
+
+    @staticmethod
+    def _needs_forced_critic_retry(
+        parsed_hypotheses: Sequence[Hypothesis],
+        previous_descriptions: Sequence[str],
+        memory_context: Optional[List[Dict[str, Any]]],
+    ) -> bool:
+        if not parsed_hypotheses or not previous_descriptions:
+            return False
+        if not AgentBrain._has_repeated_boundary_failures(memory_context):
+            return False
+        top_new = parsed_hypotheses[0].description
+        if not top_new:
+            return False
+        max_similarity = max(
+            _description_similarity(top_new, old_desc) for old_desc in previous_descriptions if old_desc
+        )
+        return max_similarity >= 0.92
 
     @staticmethod
     def _format_observation_context(observation: NeuronpediaObservation) -> Dict[str, Any]:
@@ -826,10 +911,11 @@ class AgentBrain:
             # Note 这个随机性有点强，需要更多的性质约束
             "- activation_negative_prompts: semantically nearby but should not trigger. "
             "Construct examples based on the input-side hypothesis description.\n"
-            "- boundary_prompts: adversarial/counterfactual prompts likely to break the hypothesis. "
+            "- boundary_prompts: hard-negative adversarial/counterfactual prompts expected NOT to trigger. "
             "Construct examples based on the input-side hypothesis description.\n"
             "- causal_prompts: contexts suitable for measuring logit shifts after feature intervention. "
             "Construct examples based on the output-side hypothesis description.\n"
+            "You must use memory failure patterns to avoid repeating uninformative boundary prompts.\n"
             "Return strict JSON only."
         )
         hypothesis_context = json.dumps(asdict(hypothesis), ensure_ascii=False, indent=2)
@@ -859,7 +945,10 @@ class AgentBrain:
             "Design requirements:\n"
             "- activation_positive: Should include hypothesized trigger semantics in diverse phrasing.\n"
             "- activation_negative: Should be hard negatives (close topic but missing key trigger).\n"
+            "- boundary: Must be hard negatives expected not to activate.\n"
             "- boundary: Must include at least one near-counterexample and one confounder.\n"
+            "- boundary: If memory shows repeated boundary failures, create new prompts that target those failure patterns without copying old strings.\n"
+            "- boundary: Do not reuse exact prompts listed in repeated_boundary_failures.\n"
             "- causal: Should place a predictive next-token position where style/semantics can shift.\n\n"
             "Output schema (JSON):\n"
             f"{schema_prompt}"
@@ -924,17 +1013,27 @@ class AgentBrain:
         if not ordered:
             return []
 
-        system_prompt = (
+        base_system_prompt = (
             "You are the Critic Agent for iterative hypothesis refinement.\n"
             "Use measured evidence to reject weak assumptions and produce stronger, more falsifiable hypotheses.\n"
             "Prioritize:\n"
             "1) fixing boundary failures\n"
             "2) fixing incorrect output-token direction predictions\n"
             "3) preserving only evidence-supported trigger patterns\n"
+            "Hard constraints:\n"
+            "- You must first identify the top 2 failure points from evidence.\n"
+            "- You must map each top failure to an explicit hypothesis change.\n"
+            "- If repeated boundary failures exist, do not return near-identical descriptions.\n"
             "Return strict JSON only."
         )
+
         evidence_payload = []
         for row in ordered:
+            failure_events = sorted(
+                [asdict(evt) for evt in row.input_evidence.failure_events],
+                key=lambda x: float(x.get("margin", 0.0)),
+                reverse=True,
+            )
             evidence_payload.append(
                 {
                     "hypothesis": asdict(row.hypothesis),
@@ -942,8 +1041,7 @@ class AgentBrain:
                     "input_summary": {
                         "score": row.input_evidence.score,
                         "separation": row.input_evidence.separation,
-                        # Note 这不必要，给分数无意义，或者说有误导性，容易让critic顺着分数说
-                        # 或者给出更细致的字段解释
+                        "failure_events": failure_events[:6],
                         "counterexamples": row.input_evidence.counterexamples,
                         "boundary_violation_rate": row.input_evidence.boundary_violation_rate,
                     },
@@ -956,6 +1054,7 @@ class AgentBrain:
                     },
                 }
             )
+
         evidence_context = json.dumps(evidence_payload, ensure_ascii=False, indent=2)
         memory_context_json = json.dumps(
             self._format_memory_context(memory_context),
@@ -971,54 +1070,97 @@ class AgentBrain:
                         "expected_logit_increase": ["..."],
                         "expected_logit_decrease": ["..."],
                         "confidence_prior": 0.5,
+                        "revision_notes": "failure->change mapping used in this refinement",
+                        "resolved_failures": ["..."],
+                        "unresolved_failures": ["..."],
                     }
                 ]
             },
             ensure_ascii=False,
             indent=2,
         )
-        user_prompt = (
-            "Task: Refine hypotheses and keep only the strongest candidates.\n"
-            f"Round: {int(round_idx)}\n"
-            f"keep_top_k: {int(keep_top_k)}\n\n"
-            "Description of evidence fields:\n"
-            "- score: The score of the hypothesis, based on the input and output evidence.\n"
-            "- separation: The separation between the activation and non-activation examples.\n"
-            "- counterexamples: Counterexamples that violate the hypothesis. This is an important basis for your improvement request.\n"
-            "- boundary_violation_rate: The rate of boundary violations in the input evidence.\n"
-            "- missing_expected_tokens: Tokens that are expected but not found in the output.\n"
-            "- sign_consistency: Consistency of the sign of logit changes.\n"
-            "- amplify_top_increase: Top tokens that increase logits the most.\n"
-            "- amplify_top_decrease: Top tokens that decrease logits the most.\n\n"
-            "Evidence:\n"
-            f"{evidence_context}\n\n"
-            "Memory from past runs:\n"
-            f"{memory_context_json}\n\n"
-            "Refinement policy:\n"
-            "- drop_if: high boundary violation and low output coverage; repeated counterexample failures across rounds.\n"
-            "- keep_if: good activation separation and stable sign-consistent causal effects.\n\n"
-            "Output schema (JSON):\n"
-            f"{schema_prompt}\n\n"
-            "Field descriptions:\n"
-            "- hypothesis_id: identifier (e.g., h1r as h1 refined)\n"
-            "- input-side/output-side feature description: observation-based description, <= 40 words each.\n"
-            "- expected_logit_increase: tokens expected to increase under amplification\n"
-            "- expected_logit_decrease: tokens expected to decrease under amplification\n"
-            "- confidence_prior: confidence score between 0 and 1"
-        )
+        previous_descriptions = [row.hypothesis.description for row in ordered[:keep_top_k]]
 
-        llm_json = self.reasoner.chat_json(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            agent_name="critic_agent",
-            call_type="hypothesis_refinement",
-            metadata={"feature_id": feature_id, "round": round_idx},
-        )
-        rows = self._extract_hypothesis_rows(llm_json)
-        if rows:
+        def _build_prompts(force_rewrite: bool) -> Tuple[str, str]:
+            rewrite_clause = ""
+            if force_rewrite:
+                rewrite_clause = (
+                    "STRICT REWRITE MODE:\n"
+                    "- Repeated boundary failures persist.\n"
+                    "- The previous refinement was too similar to old descriptions.\n"
+                    "- You must materially rewrite the input-side trigger statement.\n"
+                    "- Avoid lexical reuse of previous core phrasing.\n\n"
+                )
+            system_prompt = base_system_prompt
+            if force_rewrite:
+                system_prompt += "\nDo not keep prior wording if repeated boundary failures remain."
+            user_prompt = (
+                "Task: Refine hypotheses and keep only the strongest candidates.\n"
+                f"Round: {int(round_idx)}\n"
+                f"keep_top_k: {int(keep_top_k)}\n\n"
+                "Description of evidence fields:\n"
+                "- score: The score of the hypothesis, based on the input and output evidence.\n"
+                "- separation: The separation between activation and non-activation examples.\n"
+                "- failure_events: structured failures with type/prompt/score/threshold/margin.\n"
+                "- counterexamples: textual summaries of main failures.\n"
+                "- boundary_violation_rate: boundary failure rate in the input evidence.\n"
+                "- missing_expected_tokens: expected but missing output tokens.\n"
+                "- sign_consistency: consistency of logit direction.\n"
+                "- amplify_top_increase / amplify_top_decrease: observed intervention effects.\n\n"
+                f"{rewrite_clause}"
+                "Mandatory reasoning steps:\n"
+                "1) List top 2 failures from evidence (or fewer if fewer exist).\n"
+                "2) Map each failure to a concrete hypothesis edit.\n"
+                "3) Produce refined hypotheses consistent with that mapping.\n\n"
+                "Evidence:\n"
+                f"{evidence_context}\n\n"
+                "Memory from past runs:\n"
+                f"{memory_context_json}\n\n"
+                "Refinement policy:\n"
+                "- drop_if: high boundary violation and low output coverage; repeated counterexample failures across rounds.\n"
+                "- keep_if: good activation separation and stable sign-consistent causal effects.\n\n"
+                "Output schema (JSON):\n"
+                f"{schema_prompt}\n\n"
+                "Field descriptions:\n"
+                "- hypothesis_id: identifier (e.g., h1r as h1 refined)\n"
+                "- description: refined combined description for input/output behavior.\n"
+                "- expected_logit_increase: tokens expected to increase under amplification\n"
+                "- expected_logit_decrease: tokens expected to decrease under amplification\n"
+                "- confidence_prior: confidence score between 0 and 1\n"
+                "- revision_notes: concise failure->change mapping used for this refinement (required)\n"
+                "- resolved_failures: failures addressed by this revision (optional)\n"
+                "- unresolved_failures: failures intentionally left unresolved (optional)"
+            )
+            return system_prompt, user_prompt
+
+        def _run_critic(force_rewrite: bool) -> Optional[List[Hypothesis]]:
+            system_prompt, user_prompt = _build_prompts(force_rewrite=force_rewrite)
+            llm_json = self.reasoner.chat_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                agent_name="critic_agent",
+                call_type="hypothesis_refinement",
+                metadata={
+                    "feature_id": feature_id,
+                    "round": round_idx,
+                    "forced_rewrite": bool(force_rewrite),
+                },
+            )
+            rows = self._extract_hypothesis_rows(llm_json)
+            if not rows:
+                return None
             parsed = self._parse_hypotheses(rows)
-            if parsed:
-                return parsed[:keep_top_k]
+            if not parsed:
+                return None
+            return parsed[:keep_top_k]
+
+        parsed = _run_critic(force_rewrite=False)
+        if parsed and self._needs_forced_critic_retry(parsed, previous_descriptions, memory_context):
+            retry_parsed = _run_critic(force_rewrite=True)
+            if retry_parsed:
+                return retry_parsed
+        if parsed:
+            return parsed
 
         fallback: List[Hypothesis] = []
         for idx, row in enumerate(ordered[:keep_top_k]):
@@ -1038,7 +1180,6 @@ class AgentBrain:
             )
             fallback.append(refined)
         return fallback
-
     def synthesize_final(
         self,
         observation: NeuronpediaObservation,
@@ -1221,29 +1362,63 @@ class FeatureExperimentRunner:
         boundary_violation_rate = _safe_mean([1.0 if v > threshold else 0.0 for v in boundary_vals])
         separation = _safe_mean(pos_vals) - _safe_mean(neg_vals)
 
-        counterexamples: List[str] = []
-        for row in sorted(neg_scores, key=lambda x: x.score, reverse=True)[:2]:
+        failure_events: List[FailureEvent] = []
+        for row in sorted(neg_scores, key=lambda x: x.score, reverse=True):
             if row.score > threshold:
-                counterexamples.append(
-                    f"Negative prompt activated strongly ({row.score:.4f} > {threshold:.4f}): {row.prompt}"
+                failure_events.append(
+                    FailureEvent(
+                        type="negative_fp",
+                        prompt=row.prompt,
+                        score=float(row.score),
+                        threshold=float(threshold),
+                        margin=float(row.score - threshold),
+                    )
                 )
-        for row in sorted(pos_scores, key=lambda x: x.score)[:2]:
+        for row in sorted(pos_scores, key=lambda x: x.score):
             if row.score <= threshold:
-                counterexamples.append(
-                    f"Positive prompt under-activated ({row.score:.4f} <= {threshold:.4f}): {row.prompt}"
+                failure_events.append(
+                    FailureEvent(
+                        type="positive_fn",
+                        prompt=row.prompt,
+                        score=float(row.score),
+                        threshold=float(threshold),
+                        margin=float(threshold - row.score),
+                    )
                 )
-        for row in sorted(boundary_scores, key=lambda x: x.score, reverse=True)[:2]:
+        for row in sorted(boundary_scores, key=lambda x: x.score, reverse=True):
             if row.score > threshold:
+                failure_events.append(
+                    FailureEvent(
+                        type="boundary_violation",
+                        prompt=row.prompt,
+                        score=float(row.score),
+                        threshold=float(threshold),
+                        margin=float(row.score - threshold),
+                    )
+                )
+
+        failure_events = sorted(failure_events, key=lambda x: x.margin, reverse=True)
+        counterexamples: List[str] = []
+        for event in failure_events[:6]:
+            if event.type == "boundary_violation":
                 counterexamples.append(
-                    f"Boundary violation ({row.score:.4f} > {threshold:.4f}): {row.prompt}"
+                    f"Boundary violation ({event.score:.4f} > {event.threshold:.4f}): {event.prompt}"
+                )
+            elif event.type == "negative_fp":
+                counterexamples.append(
+                    f"Negative prompt activated strongly ({event.score:.4f} > {event.threshold:.4f}): {event.prompt}"
+                )
+            elif event.type == "positive_fn":
+                counterexamples.append(
+                    f"Positive prompt under-activated ({event.score:.4f} <= {event.threshold:.4f}): {event.prompt}"
                 )
 
         separation_term = 1.0 / (1.0 + math.exp(-2.0 * separation))
         score = (
-            0.35 * separation_term
-            + 0.3 * pos_hit_rate
+            0.30 * separation_term
+            + 0.25 * pos_hit_rate
             + 0.25 * neg_reject_rate
-            + 0.1 * (1.0 - boundary_violation_rate)
+            + 0.20 * (1.0 - boundary_violation_rate)
         )
 
         return InputEvidence(
@@ -1256,6 +1431,7 @@ class FeatureExperimentRunner:
             negative_reject_rate=float(neg_reject_rate),
             boundary_violation_rate=float(boundary_violation_rate),
             separation=float(separation),
+            failure_events=failure_events[:8],
             counterexamples=counterexamples[:6],
             score=_clip01(score),
         )
@@ -1491,6 +1667,8 @@ class AgenticFeatureExplainer:
         best_row: Optional[HypothesisRoundResult] = None
         best_score = -1.0
         stale_rounds = 0
+        boundary_failure_counts: Dict[str, int] = {}
+        consecutive_repeated_boundary_rounds = 0
 
         for round_idx in range(1, self.max_rounds + 1):
             round_results: List[HypothesisRoundResult] = []
@@ -1510,6 +1688,7 @@ class AgenticFeatureExplainer:
                     0.55 * input_evidence.score
                     + 0.45 * output_evidence.score
                     + 0.05 * hyp.confidence_prior
+                    - 0.15 * input_evidence.boundary_violation_rate
                 )
                 total_score = _clip01(total_score)
                 row = HypothesisRoundResult(
@@ -1560,22 +1739,68 @@ class AgenticFeatureExplainer:
             )
 
             china_tz = timezone(timedelta(hours=8))
+            round_has_repeated_boundary_failures = False
             for row in round_results:
+                row_failure_events = [asdict(evt) for evt in row.input_evidence.failure_events]
+                repeated_boundary_failures: List[Dict[str, Any]] = []
+                for event in row_failure_events:
+                    if str(event.get("type")) != "boundary_violation":
+                        continue
+                    prompt = str(event.get("prompt", "")).strip()
+                    prompt_key = _normalize_prompt_key(prompt)
+                    if not prompt_key:
+                        continue
+                    boundary_failure_counts[prompt_key] = boundary_failure_counts.get(prompt_key, 0) + 1
+                    repeat_count = boundary_failure_counts[prompt_key]
+                    if repeat_count >= 2:
+                        repeated_boundary_failures.append(
+                            {
+                                "prompt": prompt,
+                                "count": int(repeat_count),
+                                "latest_margin": float(event.get("margin", 0.0)),
+                            }
+                        )
+                repeated_boundary_failures = sorted(
+                    repeated_boundary_failures,
+                    key=lambda x: (int(x.get("count", 0)), float(x.get("latest_margin", 0.0))),
+                    reverse=True,
+                )
+                if repeated_boundary_failures:
+                    round_has_repeated_boundary_failures = True
                 memory_entry = {
                     "timestamp": datetime.now(china_tz).isoformat() + "Z",
                     "feature_id": int(feature_id),
                     "round": int(round_idx),
                     "hypothesis_id": row.hypothesis.hypothesis_id,
-                    "notes": row.hypothesis.description,  # 假说内容
+                    "hypothesis_summary": row.hypothesis.description,
+                    "notes": row.hypothesis.description,
                     "score": row.total_score,
-                    "counterexamples": row.input_evidence.counterexamples[:3],
-                    "missing_expected_tokens": row.output_evidence.missing_expected_tokens[:4],
+                    "score_breakdown": {
+                        "total_score": row.total_score,
+                        "input_score": row.input_evidence.score,
+                        "output_score": row.output_evidence.score,
+                        "boundary_violation_rate": row.input_evidence.boundary_violation_rate,
+                        "confidence_prior": row.hypothesis.confidence_prior,
+                    },
+                    "counterexamples": row.input_evidence.counterexamples,
+                    "failure_events": row_failure_events[:8],
+                    "repeated_boundary_failures": repeated_boundary_failures[:6],
+                    "missing_expected_tokens": row.output_evidence.missing_expected_tokens[:6],
                 }
                 self.memory_store.append(memory_entry)
                 memory_context.append(memory_entry)
+            if round_has_repeated_boundary_failures:
+                consecutive_repeated_boundary_rounds += 1
+            else:
+                consecutive_repeated_boundary_rounds = 0
 
             # early stop
-            if best_score >= 0.82 and stale_rounds >= 1:
+            if (
+                best_score >= 0.82
+                and stale_rounds >= 1
+                and round_best.input_evidence.boundary_violation_rate <= 0.25
+                and consecutive_repeated_boundary_rounds < 2
+            ):
                 break
 
             # critic refine
@@ -1630,9 +1855,19 @@ class AgenticFeatureExplainer:
                 "round": "final",
                 "hypothesis_id": best_row.hypothesis.hypothesis_id,
                 "score": best_row.total_score,
+                "hypothesis_summary": final_report.combined_explanation,
                 "notes": final_report.combined_explanation,
-                "counterexamples": final_report.boundaries[:3],
-                "missing_expected_tokens": best_row.output_evidence.missing_expected_tokens[:4],
+                "score_breakdown": {
+                    "total_score": best_row.total_score,
+                    "input_score": best_row.input_evidence.score,
+                    "output_score": best_row.output_evidence.score,
+                    "boundary_violation_rate": best_row.input_evidence.boundary_violation_rate,
+                    "confidence_prior": best_row.hypothesis.confidence_prior,
+                },
+                "counterexamples": final_report.boundaries,
+                "failure_events": [asdict(evt) for evt in best_row.input_evidence.failure_events][:8],
+                "repeated_boundary_failures": [],
+                "missing_expected_tokens": best_row.output_evidence.missing_expected_tokens[:6],
             }
         )
         return final_report
@@ -1820,3 +2055,5 @@ if __name__ == "__main__":
     )
 
     explainer.collect_initial_observation(feature_id=args.feature_id)
+
+
