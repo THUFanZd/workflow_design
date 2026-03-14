@@ -15,5 +15,4 @@ dependencies = [
     "openai-agents",
     "langchain>=1.2.12",
     "langchain-openai>=1.1.11",
-    "huggingface-hub[xet]>=0.36.2",
 ]
