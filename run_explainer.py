@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from agentic_feature_explainer import (
     OpenAICompatibleReasoner,
     format_explanation_markdown,
 )
+from download_checkpoints import resolve_canonical_sae_id
 from model_with_sae import ModelWithSAEModule
 
 try:
@@ -23,6 +25,83 @@ try:
     import myagents.api_key  # noqa: F401
 except Exception:
     pass
+
+
+DEFAULT_SAE_RELEASE = "gemma-scope-2b-pt-res"
+DEFAULT_SAE_REPO_ID = "google/gemma-scope-2b-pt-res"
+DEFAULT_SAE_WIDTH = "16k"
+DEFAULT_LAYER = 6
+
+
+def infer_layer_from_sae_path(sae_path: str) -> int | None:
+    if not sae_path:
+        return None
+    candidates = [sae_path]
+    if sae_path.startswith("sae-lens://"):
+        spec = sae_path[len("sae-lens://") :]
+        kv: dict[str, str] = {}
+        for part in [p.strip() for p in spec.split(";") if p.strip()]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                kv[key.strip()] = value.strip()
+        sae_id = kv.get("sae_id") or kv.get("path")
+        if sae_id:
+            candidates.insert(0, sae_id)
+
+    for text in candidates:
+        match = re.search(r"layer[_-]?(\d+)", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def infer_layer_from_neuronpedia_source(source: str) -> int | None:
+    if not source:
+        return None
+    match = re.match(r"^\s*(\d+)-", source)
+    return int(match.group(1)) if match else None
+
+
+def resolve_conflict_free_sae_settings(args: argparse.Namespace) -> None:
+    canonical_map_path = Path(args.canonical_map)
+    if not canonical_map_path.is_absolute():
+        canonical_map_path = Path(__file__).with_name(args.canonical_map)
+
+    if not args.sae_path:
+        resolved = resolve_canonical_sae_id(
+            layer=args.layer,
+            width=args.width,
+            release=args.sae_release,
+            repo_id=args.sae_repo_id,
+            canonical_map_path=canonical_map_path,
+        )
+        args.sae_path = f"sae-lens://release={args.sae_release};sae_id={resolved.sae_id}"
+
+    if not args.neuronpedia_source:
+        args.neuronpedia_source = f"{args.layer}-gemmascope-res-{args.width}"
+
+    if args.sae_layer is None:
+        args.sae_layer = args.layer
+
+    sae_layer = infer_layer_from_sae_path(args.sae_path)
+    if sae_layer is not None and sae_layer != args.layer:
+        raise ValueError(
+            f"Parameter conflict: --layer={args.layer} but sae_path implies layer={sae_layer}. "
+            "Please keep them consistent."
+        )
+
+    np_layer = infer_layer_from_neuronpedia_source(args.neuronpedia_source)
+    if np_layer is not None and np_layer != args.layer:
+        raise ValueError(
+            f"Parameter conflict: --layer={args.layer} but neuronpedia_source implies layer={np_layer}. "
+            "Please keep them consistent."
+        )
+
+    if args.sae_layer != args.layer:
+        raise ValueError(
+            f"Parameter conflict: --sae_layer={args.sae_layer} but --layer={args.layer}. "
+            "Please keep them consistent."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,15 +115,40 @@ def parse_args() -> argparse.Namespace:
         help="Model path or HF name.",
     )
     parser.add_argument(
+        "--layer",
+        type=int,
+        default=DEFAULT_LAYER,
+        help="Shared SAE layer index; used to build default sae_path and neuronpedia_source.",
+    )
+    parser.add_argument("--width", type=str, default=DEFAULT_SAE_WIDTH, help="SAE width, e.g. 16k/65k/1m.")
+    parser.add_argument("--sae_release", type=str, default=DEFAULT_SAE_RELEASE, help="SAE-Lens release name.")
+    parser.add_argument(
+        "--sae_repo_id",
+        type=str,
+        default=DEFAULT_SAE_REPO_ID,
+        help="HF repo id used by canonical fallback listing.",
+    )
+    parser.add_argument(
+        "--canonical_map",
+        type=str,
+        default="canonical_map.txt",
+        help="Path to canonical map file for resolving average_l0.",
+    )
+    parser.add_argument(
         "--sae_path",
         type=str,
-        default="sae-lens://release=gemma-scope-2b-pt-res;sae_id=layer_6/width_16k/average_l0_70",  #"models/models--google--gemma-scope-2b-pt-res/layer_0/width_16k/average_l0_105/params.npz",
-        help="SAE path (.npz local, .pt local, or sae-lens:// URI).",
+        default="",
+        help="SAE path (.npz local, .pt local, or sae-lens:// URI). If empty, auto-resolved from layer/width.",
     )
     parser.add_argument("--sae_layer", type=int, default=None, help="SAE layer index. Optional if inferrable.")
 
     parser.add_argument("--neuronpedia_model_id", type=str, default="gemma-2-2b")
-    parser.add_argument("--neuronpedia_source", type=str, default="0-gemmascope-res-16k")
+    parser.add_argument(
+        "--neuronpedia_source",
+        type=str,
+        default="",
+        help="Neuronpedia source. If empty, auto-set as '<layer>-gemmascope-res-<width>'.",
+    )
 
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--initial_hypotheses", type=int, default=1)
@@ -70,7 +174,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_json", type=str, default="")
     parser.add_argument("--output_md", type=str, default="")
     parser.add_argument("--quiet", action="store_true", help="Do not print markdown report to stdout.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    resolve_conflict_free_sae_settings(args)
+    return args
 
 
 def resolve_device(device_arg: str) -> str:
