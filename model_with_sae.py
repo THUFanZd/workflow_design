@@ -1177,7 +1177,7 @@ if __name__ == "__main__":
     module = ModelWithSAEModule(
         llm_name=llm_name,
         sae_path=sae_path,
-        sae_layer=6,             # 【修改点1】修正为 6 
+        sae_layer=6,
         feature_index=test_feature_index,
         device=device,
         debug=True

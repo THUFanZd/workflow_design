@@ -32,13 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_name",
         type=str,
-        default="models/models--google--gemma-2-2b",
+        default="google/gemma-2-2b",  # "models/models--google--gemma-2-2b",
         help="Model path or HF name.",
     )
     parser.add_argument(
         "--sae_path",
         type=str,
-        default="models/models--google--gemma-scope-2b-pt-res/layer_0/width_16k/average_l0_105/params.npz",
+        default="sae-lens://release=gemma-scope-2b-pt-res;sae_id=layer_6/width_16k/average_l0_70",  #"models/models--google--gemma-scope-2b-pt-res/layer_0/width_16k/average_l0_105/params.npz",
         help="SAE path (.npz local, .pt local, or sae-lens:// URI).",
     )
     parser.add_argument("--sae_layer", type=int, default=None, help="SAE layer index. Optional if inferrable.")
